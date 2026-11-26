@@ -1,18 +1,26 @@
 from display.inspection import LinkUnavailable
 from lesson.rounds import mark_round_closed, require_request_id, require_round_id
+from lesson.seats import binding_authorizations
 from review.breakdown import summarize_results
 from review.roster_results import build_roster_results
 from review.snapshot_store import ReviewSnapshot
 
 
 class ReviewService:
-    def __init__(self, rounds, operations, dispatch, room, snapshots, history):
+    def __init__(self, rounds, operations, dispatch, room, snapshots, history, swaps=None):
         self.rounds = rounds
         self.operations = operations
         self.dispatch = dispatch
         self.room = room
         self.snapshots = snapshots
         self.history = history
+        self.swaps = swaps
+
+    def _unsettled(self, db, round_id, round_):
+        if self.swaps is not None and self.swaps.unsettled_for_round(db, round_id):
+            return True
+        valid_authorizations = binding_authorizations(round_.bindings)
+        return self.operations.pending_for_round(db, round_id, valid_authorizations)
 
     def close_round(self, db, round_id, request_id):
         require_round_id(round_id)
@@ -20,12 +28,12 @@ class ReviewService:
         pending = {'status': 'pending', 'round_id': round_id, 'request_id': request_id}
         with db:
             db.execute('BEGIN IMMEDIATE')
-            self.rounds.get(db, round_id)
+            round_ = self.rounds.get(db, round_id)
             self.snapshots.bind_close_request(db, round_id, request_id)
             existing = self.history.for_round(db, round_id)
             if existing is not None:
                 return existing
-            if self.operations.pending_for_round(db, round_id):
+            if self._unsettled(db, round_id, round_):
                 return pending
             observed_reveal = self.dispatch.for_round(db, round_id)
 
@@ -42,10 +50,10 @@ class ReviewService:
             existing = self.history.for_round(db, round_id)
             if existing is not None:
                 return existing
-            if (self.dispatch.for_round(db, round_id) != observed_reveal
-                    or self.operations.pending_for_round(db, round_id)):
-                return pending
             round_ = self.rounds.get(db, round_id)
+            if (self.dispatch.for_round(db, round_id) != observed_reveal
+                    or self._unsettled(db, round_id, round_)):
+                return pending
             rows = build_roster_results(round_, self.operations.receipts_for_round(db, round_id))
             snapshot = ReviewSnapshot(
                 round_id, request_id, round_.edition_id, round_.question.id,

@@ -23,6 +23,7 @@
 | 成绩 | `/read_prompt` | `round_id` | 本轮公共题面 |
 | 成绩 | `/play_prompt` | `round_id` | 持久记录播放并交付完整 WAV 的 Base64 与公共题面 |
 | 成绩 | `/submit` | `round_id`, `seat`, `request_id`, `choice` | `accepted` 首执或 `pending` |
+| 成绩 | `/swap_seats` | `round_id`, `device_a`, `device_b`, `request_id` | `swapped` 两席新授权，或 `pending` |
 | 成绩 | `/reveal` | `round_id`, `request_id` | 登记待显示，或复领 `shown` 原结局 |
 | 成绩及教室 | `/apply_display` | `round_id`, `request_id` | 使已登记画面在教室生效，或复领原实显 |
 | 教室 | `/current_display` | `round_id` | 当前生效画面及本轮实显次数 |
@@ -34,3 +35,7 @@
 教室显示的可观察生效点是 `/current_display` 可读取持久的答案画面。发令后可以暂缓 `/apply_display`。生效后即使回包丢失，同一原号仍可查实，重投不重复显示。答卷在实际揭晓前正式受理计 `blind`，揭晓后计 `hinted`。同号同参可续办或复领。答卷 `pending` 只有状态和身份，已定稿首执保留 `choice`、`correct`、整数 `points` 和首次 `category`。
 
 无效输入返回 HTTP 400 和 `error`。未知原号、轮次或版号返回 404。原号异参、已经被占用的席位或关轮后的新操作返回 409。待查返回 202，成功返回 200。揭晓已登记时，关轮等待实显结清。一个关轮请求号保留本轮复盘的办理身份。已定稿复盘列出各席原选择、正确项与首执，未交卷席位使用 `missing` 并保留空选择和空分值。两类小计分别按正式行计算实交人数、总分和答对人数。零分题仍可有答对人数。
+
+## 设备席位与调位
+
+`/open_round` 的 `seats` 也接受 `{"device","student"}` 对象列表进入设备席位模式：`/open_round` 与 `/get_round` 额外返回按设备顺序排列的 `bindings`，每项含 `device`、`student` 和服务签发的 `authorization`，`seats` 以同一顺序列出学员。设备模式 `/submit` 改收 `device`、`authorization`，首执与复盘行额外记录实际交卷/关轮时的 `device`。`/swap_seats` 交换本轮两台不同设备、为两席换发新授权并作废旧授权；相同原号参数可续办或复领，调位未结清或仍有有效授权下的待办答卷时 `/close_round` 返回 202。完整约定与断点位见 [SEAT_SWAPS.md](SEAT_SWAPS.md)，业务核验见 `tests/test_seat_swap_behavior.py`，对照场景可运行 `python3 -B seat_swap_scene.py`。

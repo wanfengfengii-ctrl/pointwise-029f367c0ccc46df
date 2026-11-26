@@ -36,9 +36,13 @@ class DisplayOutcomes:
                 seat TEXT NOT NULL,
                 choice TEXT NOT NULL,
                 reveal_request_id TEXT REFERENCES visible_frames (request_id),
+                device TEXT,
                 UNIQUE (round_id, seat)
             )
         ''')
+        columns = {row[1] for row in db.execute('PRAGMA table_info(admission_decisions)')}
+        if 'device' not in columns:
+            db.execute('ALTER TABLE admission_decisions ADD COLUMN device TEXT')
 
     def record_visible(self, db, outcome: DisplayOutcome):
         db.execute(
@@ -54,7 +58,8 @@ class DisplayOutcomes:
             return None
         return DisplayOutcome(row['request_id'], AnswerFrame(**json.loads(row['frame'])))
 
-    def decide_submission(self, db, round_id, request_id, seat, choice):
+    def decide_submission(self, db, round_id, request_id, seat, choice,
+                          device=None, authorization=None):
         require_round_id(round_id)
         require_request_id(request_id)
         require_text(seat, 'invalid_seat')
@@ -68,8 +73,19 @@ class DisplayOutcomes:
             if row is not None:
                 if (row['round_id'], row['seat'], row['choice']) != (round_id, seat, choice):
                     raise Conflict('submission_request_changed')
+                if 'device' in row.keys() and row['device'] is not None \
+                        and device is not None and row['device'] != device:
+                    raise Conflict('submission_request_changed')
                 reveal_request_id = row['reveal_request_id']
+                stored_device = row['device'] if 'device' in row.keys() else None
             else:
+                revoked = db.execute(
+                    'SELECT 1 FROM authorization_revocations '
+                    'WHERE round_id = ? AND authorization = ? LIMIT 1',
+                    (round_id, authorization),
+                ).fetchone() if authorization else None
+                if revoked is not None:
+                    raise Conflict('authorization_revoked')
                 occupied = db.execute(
                     'SELECT 1 FROM admission_decisions WHERE round_id = ? AND seat = ?',
                     (round_id, seat),
@@ -80,10 +96,11 @@ class DisplayOutcomes:
                 reveal_request_id = visible.request_id if visible is not None else None
                 db.execute('''
                     INSERT INTO admission_decisions
-                        (request_id, round_id, seat, choice, reveal_request_id)
-                    VALUES (?, ?, ?, ?, ?)
-                ''', (request_id, round_id, seat, choice, reveal_request_id))
-        return {
+                        (request_id, round_id, seat, choice, reveal_request_id, device)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (request_id, round_id, seat, choice, reveal_request_id, device))
+                stored_device = device
+        result = {
             'status': 'decided',
             'round_id': round_id,
             'request_id': request_id,
@@ -92,3 +109,6 @@ class DisplayOutcomes:
             'category': 'blind' if reveal_request_id is None else 'hinted',
             'reveal_request_id': reveal_request_id,
         }
+        if stored_device is not None:
+            result['device'] = stored_device
+        return result

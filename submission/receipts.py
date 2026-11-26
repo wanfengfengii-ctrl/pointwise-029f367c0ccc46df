@@ -15,9 +15,10 @@ class Receipt:
     score: Score
     category: str
     reveal_request_id: str | None
+    device: str | None = None
 
     def to_dict(self):
-        return {
+        result = {
             'status': 'accepted',
             'request_id': self.request_id,
             'round_id': self.round_id,
@@ -28,13 +29,16 @@ class Receipt:
             'category': self.category,
             'reveal_request_id': self.reveal_request_id,
         }
+        if self.device is not None:
+            result['device'] = self.device
+        return result
 
     @classmethod
     def from_dict(cls, data):
         return cls(
             data['request_id'], data['round_id'], data['seat'], data['choice'],
             Score(data['correct'], data['points']), data['category'],
-            data['reveal_request_id'],
+            data['reveal_request_id'], data.get('device'),
         )
 
 
@@ -43,5 +47,5 @@ def make_receipt(request, score: Score, category: str, reveal_request_id: str | 
         raise ValueError('invalid_admission_evidence')
     return Receipt(
         request.request_id, request.round_id, request.seat, request.choice,
-        score, category, reveal_request_id,
+        score, category, reveal_request_id, request.device,
     )

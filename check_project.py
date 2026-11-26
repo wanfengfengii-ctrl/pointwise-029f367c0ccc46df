@@ -4,7 +4,14 @@ import unittest
 
 
 def main():
-    suite = unittest.defaultTestLoader.discover('tests', top_level_dir='.')
+    loader = unittest.defaultTestLoader
+    suite = loader.discover('tests', top_level_dir='.')
+    # Include the transport-control seat swap comparison shipped at repo root.
+    try:
+        import seat_swap_scene
+        suite.addTests(loader.loadTestsFromModule(seat_swap_scene))
+    except Exception as error:  # pragma: no cover - surfaced as load failure
+        print(f'could not load seat_swap_scene: {error}', file=sys.stderr)
     if suite.countTestCases():
         result = unittest.TextTestRunner(verbosity=2).run(suite)
     else:

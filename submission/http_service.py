@@ -19,12 +19,14 @@ from display.jobs import RevealJobs
 from display.outcomes import DisplayOutcomes
 from display.reveal import RevelationService
 from display.screen import build_answer_frame
+from display.seat_swaps import ClassroomSeatSwaps
 from exercise.catalog import EditionCatalog
 from exercise.publication import PublicationService
 from lesson.classroom import ClassroomService
 from lesson.prompt_playback import PromptPlayback
 from lesson.round_store import RoundStore
 from lesson.rounds import Conflict, require_request_id, require_round_id
+from lesson.swap_ops import SeatSwapOperations, SeatSwapService
 from review.finalize import ReviewService
 from review.history import ReviewHistory
 from review.snapshot_store import ReviewSnapshotStore
@@ -75,8 +77,16 @@ class ClassroomLink:
             raise LinkUnavailable('classroom_reply_unavailable')
         return result
 
-    def decide_submission(self, identity):
-        return self.call('/internal/decide', identity)
+    def decide_submission(self, identity, device=None, authorization=None):
+        body = dict(identity)
+        if device is not None:
+            body['device'] = device
+        if authorization is not None:
+            body['authorization'] = authorization
+        return self.call('/internal/decide', body)
+
+    def swap_seats(self, body):
+        return self.call('/internal/swap_seats', body)
 
     def round_reveal_status(self, round_id):
         return self.call('/internal/reveal_status', {'round_id': round_id})
@@ -221,12 +231,15 @@ class ServiceRuntime:
         catalog = EditionCatalog()
         rounds = RoundStore(catalog)
         operations = SubmissionOperations()
+        swap_operations = SeatSwapOperations()
         dispatch = RevealDispatchStore()
         snapshots = ReviewSnapshotStore()
         jobs = RevealJobs()
         outcomes = DisplayOutcomes()
-        self._initialize('score', (catalog, rounds, operations, dispatch, snapshots))
-        self._initialize('room', (jobs, outcomes))
+        room_swaps = ClassroomSeatSwaps()
+        self._initialize('score', (catalog, rounds, operations, swap_operations,
+                                   dispatch, snapshots))
+        self._initialize('room', (jobs, outcomes, room_swaps))
 
         try:
             for side, port in (('score', score_port), ('room', room_port)):
@@ -249,7 +262,9 @@ class ServiceRuntime:
         admission = AdmissionService(rounds, operations)
         history = ReviewHistory(snapshots)
         intake = SubmissionService(operations, admission, room, relay, history)
-        review = ReviewService(rounds, operations, dispatch, room, snapshots, history)
+        seat_swaps = SeatSwapService(rounds, swap_operations, room)
+        review = ReviewService(rounds, operations, dispatch, room, snapshots, history,
+                               swap_operations)
         self.routes = {
             'score': {
                 '/proof': publication.proof,
@@ -259,6 +274,7 @@ class ServiceRuntime:
                 '/read_prompt': playback.read_prompt,
                 '/play_prompt': playback.play,
                 '/submit': intake.submit,
+                '/swap_seats': seat_swaps.swap_seats,
                 '/lookup': intake.lookup,
                 '/reveal': relay.reveal,
                 '/apply_display': relay.apply_display,
@@ -271,6 +287,7 @@ class ServiceRuntime:
                 '/internal/lookup_reveal': inspection.lookup_reveal,
                 '/internal/reveal_status': inspection.round_reveal_status,
                 '/internal/decide': outcomes.decide_submission,
+                '/internal/swap_seats': room_swaps.apply_swap,
             },
         }
 
@@ -378,6 +395,139 @@ def run_demo():
             'oracle': '按样例答案键手算甲乙两卷并逐类求和，丙按固定名单单列。',
         }
         print('POINTWISE_SCENARIO ' + json.dumps(evidence, ensure_ascii=False))
+    run_seat_swap_demo()
+
+
+def run_seat_swap_demo():
+    """Reproduce SEAT_SWAPS.md main scene: lost acceptance reply, held old
+    order, swap, late rejection and replay of the review by close number."""
+    from copy import deepcopy
+    from threading import Lock
+
+    with tempfile.TemporaryDirectory(prefix='songlan-swap-') as directory:
+        lock = Lock()
+        held = {('/internal/decide', 'u')}
+        captured = {}
+        drops = {('room', '/internal/decide', 'a'): 'decided'}
+
+        def before_forward(path, body):
+            key = (path, body.get('request_id'))
+            with lock:
+                if key in held:
+                    captured[key] = deepcopy(body)
+                    return True
+            return False
+
+        def before_reply(side, path, body, result):
+            key = (side, path, body.get('request_id'))
+            with lock:
+                wanted = drops.get(key)
+                if wanted is not None and result.get('status') == wanted:
+                    del drops[key]
+                    return True
+            return False
+
+        with build_runtime(directory, before_forward=before_forward,
+                           before_reply=before_reply) as runtime:
+            def call(path, status=200, side='score', token=False, **body):
+                code, data = exchange(
+                    runtime.address(side), path, body,
+                    runtime.token if token else None,
+                )
+                if code != status:
+                    raise RuntimeError(
+                        f'{side}{path}: expected HTTP {status}, got {code}: {data}',
+                    )
+                return data
+
+            draft = json.loads((SAMPLES / 'daily.json').read_text(encoding='utf-8'))
+            edition = call('/publish', **draft)['edition_id']
+            opened = call('/open_round', edition_id=edition, question_id='pulses', seats=[
+                {'device': 'S1', 'student': '甲'},
+                {'device': 'S2', 'student': '乙'},
+                {'device': 'S3', 'student': '丙'},
+            ])
+            rid = opened['round_id']
+            auth = {b['device']: b['authorization'] for b in opened['bindings']}
+            call('/play_prompt', round_id=rid)
+
+            waiting_a = call('/submit', 202, round_id=rid, request_id='a',
+                             device='S1', authorization=auth['S1'], choice='A')
+            waiting_u = call('/submit', 202, round_id=rid, request_id='u',
+                             device='S2', authorization=auth['S2'], choice='B')
+            swapped = call('/swap_seats', round_id=rid, request_id='swap-1',
+                           device_a='S1', device_b='S2')
+            new_auth = {b['device']: b['authorization'] for b in swapped['bindings']}
+
+            call('/reveal', 202, round_id=rid, request_id='show')
+            call('/apply_display', round_id=rid, request_id='show')
+
+            second = call('/submit', round_id=rid, request_id='b', device='S1',
+                          authorization=new_auth['S1'], choice='B')
+
+            held_body = captured.pop(('/internal/decide', 'u'))
+            with lock:
+                held.discard(('/internal/decide', 'u'))
+            late_status, late_body = exchange(
+                runtime.address('room'), '/internal/decide', held_body, runtime.token,
+            )
+            score_late_status, score_late_body = exchange(
+                runtime.address('score'), '/submit', {
+                    'round_id': rid, 'request_id': 'u', 'device': 'S2',
+                    'authorization': auth['S2'], 'choice': 'B',
+                },
+            )
+            first = call('/submit', round_id=rid, request_id='a', device='S1',
+                         authorization=auth['S1'], choice='A')
+            review = call('/close_round', round_id=rid, request_id='close-swap')
+
+        with build_runtime(directory) as runtime:
+            replay_status, replay = exchange(runtime.address('score'), '/lookup', {
+                'round_id': rid, 'kind': 'close', 'request_id': 'close-swap',
+            })
+        if replay_status != 200 or replay != review:
+            raise RuntimeError('调位复盘按原关轮号复领不一致')
+
+        order = [(row['device'], row['seat']) for row in replay['seats']]
+        checks = {
+            'waiting_a': waiting_a,
+            'waiting_u': waiting_u,
+            'swap_status': swapped['status'],
+            'order': order,
+            'a_receipt': [first['category'], first['points'], first['device']],
+            'b_receipt': [second['category'], second['points'], second['device']],
+            'late_room_http': late_status,
+            'late_room_error': late_body.get('error'),
+            'late_score_http': score_late_status,
+            'late_score_error': score_late_body.get('error'),
+            'replay_close_matches': replay == review,
+            'jia_close_device': replay['seats'][1]['device'],
+            'jia_receipt_device': replay['seats'][1]['receipt']['device'],
+        }
+        expected_order = [['S1', '乙'], ['S2', '甲'], ['S3', '丙']]
+        if (order != [tuple(x) for x in expected_order]
+                or checks['a_receipt'] != ['blind', 3, 'S1']
+                or checks['b_receipt'] != ['hinted', 0, 'S1']
+                or late_status != 409 or score_late_status != 409
+                or not checks['replay_close_matches']
+                or checks['jia_close_device'] != 'S2'
+                or checks['jia_receipt_device'] != 'S1'):
+            raise RuntimeError(f'调位样例核对失败: {json.dumps(checks, ensure_ascii=False)}')
+        print('SEAT_SWAP_DEMO ' + json.dumps(checks, ensure_ascii=False))
+        evidence = {
+            'case_id': 'seat-swap',
+            'input': {
+                'question': 'pulses', 'answer': 'A', 'points': 3,
+                'events': ['a:S1:A(reply-lost)', 'u:S2:B(held)', 'swap S1/S2',
+                           'display', 'b:S1:B(new-auth)', 'release u',
+                           'a resume', 'close', 'reopen replay'],
+            },
+            'actual': checks,
+            'oracle': '甲原单领回 blind/3/S1；乙新授权 S1 首交 hinted/0；'
+                      '旧授权 u 迟达 409；复盘按最终设备序 S1乙 S2甲 S3丙。',
+        }
+        print('POINTWISE_SEAT_SWAP_SCENARIO '
+              + json.dumps(evidence, ensure_ascii=False))
 
 
 def main():
