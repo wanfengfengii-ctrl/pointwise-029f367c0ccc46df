@@ -1,0 +1,13 @@
+{
+  "book": "活动中心听辨练习",
+  "questions": [
+    {
+      "id": "pulses",
+      "prompt": "短音响了几次？",
+      "audio": "two-pulses.wav.z64",
+      "options": [{"id": "A", "label": "两次"}, {"id": "B", "label": "一次"}],
+      "answer": "A",
+      "points": 3
+    }
+  ]
+}
